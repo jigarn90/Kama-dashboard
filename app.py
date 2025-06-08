@@ -5,18 +5,20 @@ import yfinance as yf
 import plotly.graph_objs as go
 import requests
 from datetime import datetime, timedelta
-from nsepy.derivatives import get_expiry_date
 
 # === Telegram Credentials ===
-TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
+import os
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 
 def send_telegram_message(message):
+    if TELEGRAM_TOKEN == "YOUR_TELEGRAM_TOKEN":
+        return  # Skip sending if token is not set
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {'chat_id': TELEGRAM_CHAT_ID, 'text': message}
     requests.post(url, data=data)
 
-# === KAMA Calculation ===
+# === KAMA Function ===
 def calculate_kama(series, length, fast_ema, slow_ema):
     direction = abs(series - series.shift(length))
     volatility = sum([abs(series.shift(i) - series.shift(i+1)) for i in range(length)])
@@ -44,19 +46,10 @@ def calculate_adx(df):
     df['ADX'] = df['DX'].rolling(14).mean()
     return df
 
-# === Load Full F&O Stock List ===
-def load_fno_list():
-    url = "https://www1.nseindia.com/content/fo/fo_mktlots.csv"
-    df = pd.read_csv(url)
-    return sorted(list(set(df['SYMBOL'].dropna().astype(str))))
+# === Main Streamlit App ===
+st.title("📊 KAMA Crossover Dashboard with TP/SL & Telegram Alerts")
 
-fno_stock_symbols = load_fno_list()
-fno_stocks = [symbol + ".NS" for symbol in fno_stock_symbols]
-
-# === Streamlit UI ===
-st.set_page_config(page_title="KAMA F&O Dashboard", layout="wide")
-st.title("📈 F&O Cash Stocks - 15 Min KAMA Crossover Scanner")
-
+symbol = st.text_input("Enter Symbol (e.g., BAJFINANCE.NS):", value="BAJFINANCE.NS")
 kama_length = st.slider("KAMA Length", 5, 30, 10)
 fast_ema = st.slider("Fast EMA", 1, 10, 2)
 slow_ema = st.slider("Slow EMA", 20, 50, 30)
@@ -65,46 +58,50 @@ take_profit = st.slider("Take Profit %", 0.5, 5.0, 2.0) / 100
 trailing_sl = st.slider("Trailing SL %", 0.5, 3.0, 1.0) / 100
 
 if st.button("Run Scanner"):
-    signals = []
-    for symbol in fno_stocks:
-        try:
-            df = yf.download(symbol, period="10d", interval="15m")
-            df.dropna(inplace=True)
-            df['MA'] = df['Close'].rolling(ma_length).mean()
-            df['KAMA'] = calculate_kama(df['Close'], kama_length, fast_ema, slow_ema)
-            df = calculate_adx(df)
+    df = yf.download(symbol, period="10d", interval="15m")
+    df.dropna(inplace=True)
+    df['MA'] = df['Close'].rolling(ma_length).mean()
+    df['KAMA'] = calculate_kama(df['Close'], kama_length, fast_ema, slow_ema)
+    df = calculate_adx(df)
 
-            for i in range(1, len(df)):
-                trend_up = df['Close'].iloc[i] > df['MA'].iloc[i]
-                trend_strong = df['ADX'].iloc[i] > 25
-                buy = df['Close'].iloc[i-1] < df['KAMA'].iloc[i-1] and df['Close'].iloc[i] > df['KAMA'].iloc[i] and trend_up and trend_strong
-                sell = df['Close'].iloc[i-1] > df['KAMA'].iloc[i-1] and df['Close'].iloc[i] < df['KAMA'].iloc[i] and not trend_up and trend_strong
+    buy_signals = []
+    sell_signals = []
 
-                price = df['Close'].iloc[i]
-                if buy:
-                    tp = price * (1 + take_profit)
-                    sl = price * (1 - trailing_sl)
-                    msg = f"📍 BUY Signal: {symbol}
-Price: ₹{price:.2f}
+    for i in range(1, len(df)):
+        trend_up = df['Close'].iloc[i] > df['MA'].iloc[i]
+        trend_strong = df['ADX'].iloc[i] > 25
+        buy = df['Close'].iloc[i-1] < df['KAMA'].iloc[i-1] and df['Close'].iloc[i] > df['KAMA'].iloc[i] and trend_up and trend_strong
+        sell = df['Close'].iloc[i-1] > df['KAMA'].iloc[i-1] and df['Close'].iloc[i] < df['KAMA'].iloc[i] and not trend_up and trend_strong
+
+        if buy:
+            buy_signals.append((df.index[i], df['Close'].iloc[i]))
+            tp = df['Close'].iloc[i] * (1 + take_profit)
+            sl = df['Close'].iloc[i] * (1 - trailing_sl)
+            msg = f"""📍 BUY Signal: {symbol}
+Price: ₹{df['Close'].iloc[i]:.2f}
 TP: ₹{tp:.2f}
-SL: ₹{sl:.2f}"
-                    send_telegram_message(msg)
-                    signals.append(msg)
-                elif sell:
-                    tp = price * (1 - take_profit)
-                    sl = price * (1 + trailing_sl)
-                    msg = f"📍 SELL Signal: {symbol}
-Price: ₹{price:.2f}
-TP: ₹{tp:.2f}
-SL: ₹{sl:.2f}"
-                    send_telegram_message(msg)
-                    signals.append(msg)
-        except:
-            continue
+SL: ₹{sl:.2f}"""
+            send_telegram_message(msg)
 
-    if signals:
-        st.success(f"{len(signals)} signals generated and sent to Telegram.")
-        for s in signals:
-            st.code(s)
-    else:
-        st.warning("No signals generated.")
+        elif sell:
+            sell_signals.append((df.index[i], df['Close'].iloc[i]))
+            tp = df['Close'].iloc[i] * (1 - take_profit)
+            sl = df['Close'].iloc[i] * (1 + trailing_sl)
+            msg = f"""📍 SELL Signal: {symbol}
+Price: ₹{df['Close'].iloc[i]:.2f}
+TP: ₹{tp:.2f}
+SL: ₹{sl:.2f}"""
+            send_telegram_message(msg)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name='Close Price'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['KAMA'], name='KAMA', line=dict(color='orange')))
+    fig.add_trace(go.Scatter(x=df.index, y=df['MA'], name='MA', line=dict(color='blue')))
+
+    for signal in buy_signals:
+        fig.add_trace(go.Scatter(x=[signal[0]], y=[signal[1]], mode='markers', marker=dict(color='green', size=10), name='Buy'))
+    for signal in sell_signals:
+        fig.add_trace(go.Scatter(x=[signal[0]], y=[signal[1]], mode='markers', marker=dict(color='red', size=10), name='Sell'))
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.success(f"Strategy executed with {len(buy_signals)} Buy and {len(sell_signals)} Sell signals.")
